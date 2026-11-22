@@ -1,0 +1,35 @@
+@import '@fontsource-variable/inter';
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    @apply bg-canvas text-ink antialiased;
+    font-feature-settings: 'tnum' 1, 'cv05' 1, 'cv11' 1; /* angka tabular untuk NIS, nilai, Rupiah */
+    -webkit-tap-highlight-color: transparent;
+  }
+  :focus-visible { outline: 2px solid #166534; outline-offset: 2px; }
+  input, select, textarea, button { font: inherit; }
+  [hidden] { display: none !important; }
+}
+
+@layer components {
+  .h1 { @apply text-[22px] font-bold tracking-tight leading-tight sm:text-[28px]; }
+  .h2 { @apply text-lg font-semibold sm:text-xl; }
+  .h3 { @apply text-base font-semibold; }
+  .caption { @apply text-xs text-ink-2; }
+  .label { @apply text-xs font-semibold text-ink-2; }
+  .eyebrow { @apply text-[11px] font-semibold uppercase tracking-[.08em] text-brand; }
+  .card { @apply min-w-0 rounded-lg border border-line bg-surface shadow-card; }
+  .gold-rule { @apply h-px bg-gold/70; }
+  .skeleton { @apply rounded bg-[length:800px_100%] animate-shimmer; background-image: linear-gradient(90deg, #EEF2F0 0, #F6F8F7 40%, #EEF2F0 80%); }
+  .safe-bottom { padding-bottom: env(safe-area-inset-bottom, 0px); }
+  .safe-top { padding-top: env(safe-area-inset-top, 0px); }
+  .scroll-fade { mask-image: linear-gradient(90deg, #000 calc(100% - 24px), transparent); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}

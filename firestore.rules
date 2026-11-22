@@ -1,0 +1,215 @@
+rules_version = '2';
+
+// SIMMA — Firestore Security Rules (Tahap 1: fondasi, akun, data induk)
+// Prinsip (PRD §3.5): default deny, least privilege, hak akses ditegakkan di sini — bukan di tampilan.
+// Hapus permanen (delete) TIDAK diberikan kepada siapa pun untuk data induk & riwayat; gunakan arsip.
+// Setiap perubahan aturan wajib lulus `npm run test:rules` sebelum dipakai dengan data asli.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- fungsi bantu ----------
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function userPath(u) { return /databases/$(database)/documents/users/$(u); }
+    function me() { return get(userPath(uid())).data; }
+    function active() { return signedIn() && exists(userPath(uid())) && me().status == 'aktif'; }
+    function hasRole(r) { return active() && me().roles.hasAny([r]); }
+    function hasAny(rs) { return active() && me().roles.hasAny(rs); }
+
+    function isSuper() { return hasRole('super_admin'); }
+    function isPengelolaData() { return hasAny(['super_admin', 'operator']); }
+    // Peran yang boleh membaca seluruh data induk untuk tugas administrasi/pengawasan.
+    function isPembacaInduk() { return hasAny(['super_admin', 'kepala', 'operator', 'tu']); }
+
+    // Hanya kolom tertentu yang berubah.
+    function onlyChanges(fields) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(fields); }
+    function unchanged(f) { return !(f in request.resource.data) && !(f in resource.data) || request.resource.data[f] == resource.data[f]; }
+
+    // Peran yang boleh diberikan Operator (tidak termasuk peran pimpinan/keuangan/sistem).
+    function operatorRoleOk(roles) {
+      return roles.hasOnly(['guru', 'wali_kelas', 'tu', 'pustakawan', 'panitia_spmb', 'siswa', 'wali_murid']);
+    }
+    function validRoles(roles) {
+      return roles is list && roles.size() > 0 && roles.hasOnly(['super_admin', 'kepala', 'operator', 'tu', 'bendahara', 'guru',
+        'wali_kelas', 'pustakawan', 'panitia_spmb', 'siswa', 'wali_murid']);
+    }
+
+    // Akses data siswa berdasarkan lingkup (PRD §3.4 & §3.6).
+    function isWaliKelasOf(classId) {
+      return hasRole('wali_kelas') && classId != null
+        && exists(/databases/$(database)/documents/classes/$(classId))
+        && get(/databases/$(database)/documents/classes/$(classId)).data.waliKelasUid == uid();
+    }
+    function isGuruOf(classId) {
+      // class_access/{classId}_{uid} dibuat Operator dari penugasan mengajar (Tahap 1.4).
+      return hasRole('guru') && classId != null
+        && exists(/databases/$(database)/documents/class_access/$(classId + '_' + uid()));
+    }
+    function isWaliMuridOf(studentId) {
+      return hasRole('wali_murid') && me().guardianId is string
+        && exists(/databases/$(database)/documents/guardian_links/$(studentId + '_' + me().guardianId))
+        && get(/databases/$(database)/documents/guardian_links/$(studentId + '_' + me().guardianId)).data.status == 'terverifikasi';
+    }
+    function isSiswaSelf(studentId) { return hasRole('siswa') && me().studentId == studentId; }
+
+    // ---------- akun pengguna ----------
+    match /users/{userId} {
+      allow get: if signedIn() && (userId == uid() || isPembacaInduk());
+      allow list: if hasAny(['super_admin', 'kepala', 'operator']);
+
+      allow create: if validRoles(request.resource.data.roles)
+        && request.resource.data.status in ['aktif', 'nonaktif']
+        && (isSuper() || (hasRole('operator') && operatorRoleOk(request.resource.data.roles)));
+
+      // Admin mengubah akun lain. Operator tidak boleh menyentuh akun ber-peran pimpinan/keuangan/sistem.
+      allow update: if userId != uid() && validRoles(request.resource.data.roles)
+        && (isSuper() || (hasRole('operator') && operatorRoleOk(resource.data.roles) && operatorRoleOk(request.resource.data.roles)));
+
+      // Pengguna sendiri hanya boleh menandai sandi sudah diganti. Tidak bisa menambah peran sendiri.
+      allow update: if userId == uid() && active()
+        && onlyChanges(['mustChangePassword', 'updatedAt'])
+        && request.resource.data.mustChangePassword == false;
+
+      allow delete: if false;
+    }
+
+    // ---------- identitas & pengaturan madrasah ----------
+    match /settings/{docId} {
+      allow read: if active();
+      allow write: if isSuper();
+    }
+
+    // ---------- tahun pelajaran, kelas, mapel ----------
+    match /academic_years/{id} {
+      allow read: if active();
+      allow create, update: if isPengelolaData();
+      allow delete: if false;
+    }
+    match /classes/{id} {
+      allow read: if active();
+      allow create, update: if isPengelolaData();
+      allow delete: if false;
+    }
+    match /subjects/{id} {
+      allow read: if active();
+      allow create, update: if isPengelolaData();
+      allow delete: if false;
+    }
+    // Riwayat kelas per tahun pelajaran (tidak pernah ditimpa; PRD §4.3).
+    match /enrollments/{id} {
+      allow read: if isPembacaInduk()
+        || isSiswaSelf(resource.data.studentId)
+        || isWaliMuridOf(resource.data.studentId)
+        || isWaliKelasOf(resource.data.get('classId', null));
+      allow create, update: if isPengelolaData();
+      allow delete: if false;
+    }
+    match /class_access/{id} {
+      allow read: if isPembacaInduk() || (signedIn() && resource.data.uid == uid());
+      allow create, update: if isPengelolaData() && id == request.resource.data.classId + '_' + request.resource.data.uid;
+      allow delete: if isPengelolaData(); // mencabut penugasan (riwayatnya ada di audit_logs)
+    }
+
+    // ---------- siswa ----------
+    match /students/{studentId} {
+      allow read: if isPembacaInduk()
+        || isWaliKelasOf(resource.data.get('classId', null))
+        || isGuruOf(resource.data.get('classId', null))
+        || isSiswaSelf(studentId)
+        || isWaliMuridOf(studentId);
+
+      // ID dokumen = NIS, sehingga NIS dijamin unik oleh database.
+      allow create: if isPengelolaData()
+        && request.resource.data.nis == studentId
+        && request.resource.data.nama is string && request.resource.data.nama.size() > 1
+        && request.resource.data.status == 'aktif'
+        && request.resource.data.archived == false;
+
+      // NIS tidak boleh diubah setelah dibuat.
+      allow update: if isPengelolaData() && request.resource.data.nis == resource.data.nis;
+
+      allow delete: if false;
+    }
+
+    // Penjaga keunikan NISN/NISM: dokumen "nisn_0123456789" → { studentId }.
+    match /uniques/{key} {
+      allow get: if isPengelolaData();
+      allow create: if isPengelolaData() && request.resource.data.studentId is string;
+      allow delete: if isPengelolaData();
+      allow update: if false;
+    }
+
+    // ---------- guru & tenaga kependidikan ----------
+    match /staff/{id} {
+      allow read: if isPembacaInduk() || (signedIn() && resource.data.userUid == uid())
+        || hasAny(['guru', 'wali_kelas', 'bendahara']); // daftar nama guru untuk jadwal/kelas
+      allow create, update: if isPengelolaData();
+      allow delete: if false;
+    }
+
+    // ---------- orang tua / wali ----------
+    match /guardians/{id} {
+      allow read: if isPembacaInduk() || (signedIn() && resource.data.userUid == uid());
+      allow create, update: if isPengelolaData();
+      allow delete: if false;
+    }
+
+    // Relasi wali–siswa. ID = `${studentId}_${guardianId}`. Wali baru melihat data anak setelah "terverifikasi".
+    match /guardian_links/{id} {
+      allow read: if isPembacaInduk()
+        || (hasRole('wali_murid') && resource.data.guardianId == me().guardianId);
+
+      allow create: if isPengelolaData()
+        && id == request.resource.data.studentId + '_' + request.resource.data.guardianId
+        && request.resource.data.status == 'menunggu'
+        && request.resource.data.createdBy == uid();
+
+      // Verifikasi/penolakan wajib mencatat siapa & kapan; siswa/wali pada relasi tidak boleh diganti.
+      allow update: if isPengelolaData()
+        && unchanged('studentId') && unchanged('guardianId')
+        && request.resource.data.status in ['menunggu', 'terverifikasi', 'ditolak']
+        && (request.resource.data.status == 'menunggu' || request.resource.data.verifiedBy == uid());
+
+      allow delete: if false;
+    }
+
+    // ---------- berkas (metadata; isi berkas ada di Google Drive) ----------
+    match /files/{id} {
+      allow read: if isPembacaInduk() || (signedIn() && resource.data.ownerUid == uid());
+      allow create: if active() && request.resource.data.ownerUid == uid();
+      allow update: if isPengelolaData() && onlyChanges(['status', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // ---------- jejak audit (tidak bisa diubah/dihapus) ----------
+    match /audit_logs/{id} {
+      allow create: if active()
+        && request.resource.data.actorUid == uid()
+        && request.resource.data.waktu == request.time;
+      allow read: if hasAny(['super_admin', 'kepala']);
+      allow update, delete: if false;
+    }
+
+    match /import_export_logs/{id} {
+      allow create: if active() && request.resource.data.actorUid == uid();
+      allow read: if hasAny(['super_admin', 'kepala', 'operator']);
+      allow update, delete: if false;
+    }
+
+    // ---------- pengumuman & notifikasi (dasar) ----------
+    match /announcements/{id} {
+      allow read: if active();
+      allow create, update: if hasAny(['super_admin', 'kepala', 'operator', 'tu']);
+      allow delete: if false;
+    }
+    match /notifications/{id} {
+      allow read: if signedIn() && resource.data.targetUid == uid();
+      allow update: if signedIn() && resource.data.targetUid == uid() && onlyChanges(['dibaca']);
+      allow create: if active();
+      allow delete: if false;
+    }
+
+    // Semua koleksi lain: ditolak (default deny).
+  }
+}
